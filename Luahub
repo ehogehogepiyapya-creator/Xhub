@@ -1,0 +1,513 @@
+--[[
+    LuaHub v5: Mobile Infinity (雪見だいふくSP)
+    Optimized for Mobile (Touch Controls, UI-based interaction)
+    Features: Train Control + Combat + Visuals + Admin Tools
+]]
+
+local OrionLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/jadpy/suki/refs/heads/main/orion"))()
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local task = task
+
+local localPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- --- [設定変数] ---
+local ToyName = "FoodHamburger"
+local EggName = localPlayer.Name
+local Interval = 0.01
+local HeadOffset = Vector3.new(0, 3, 0)
+local SpawnTimeout = 1.0
+
+-- 状態フラグ
+local Running = false
+local LoopThread = nil
+local TrainNoclipEnabled = false
+local TrainSpinEnabled = false
+local InfJumpEnabled = false
+local Noclip = false
+local PlayerFlyEnabled = false
+local ESPEnabled = false
+local HitboxExpanded = false
+local AimbotEnabled = false
+
+-- 飛行・物理定数
+local FLY_SPEED = 15
+local SPEED_MULT = 25
+local BV_P = 25000
+local BG_P = 6000
+local SPIN_SPEED = 5
+local PlayerFlySpeed = 50
+
+-- オブジェクト参照
+local PM = localPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule")
+local CM = require(PM:WaitForChild("ControlModule"))
+local BV, BG
+local TargetPart = nil
+local PlayerBV = nil
+local VFlyEnabled = false
+
+-- 列車ロジック用
+local TrainControl = false
+local TrainEnableAt = 0
+local LastSitAttempt = 0
+local HadSeatOnce = false
+local SeatGraceSeconds = 2.5
+local SitRetryInterval = 0.15
+
+----------------------------------------------------------
+-- [Core] 列車 & Toy ロジック (Yukimi Engine)
+----------------------------------------------------------
+local function getMoveVector() return CM:GetMoveVector() end
+
+local function getToyInFolder()
+    local folder = Workspace:FindFirstChild(localPlayer.Name .. "SpawnedInToys")
+    return folder and folder:FindFirstChild(ToyName) or nil
+end
+
+local function spawnToy(targetCFrame)
+    local menu = ReplicatedStorage:FindFirstChild("MenuToys")
+    local spawnRF = menu and menu:FindFirstChild("SpawnToyRemoteFunction")
+    if not spawnRF then return nil end
+    pcall(function() spawnRF:InvokeServer(ToyName, targetCFrame, Vector3.new(0, 0, 0)) end)
+    local start = tick()
+    while tick() - start < SpawnTimeout do
+        local toy = getToyInFolder()
+        if toy then return toy end
+        task.wait(0.05)
+    end
+    return nil
+end
+
+local function ensureToy()
+    local toy = getToyInFolder()
+    if toy then return toy end
+    local char = localPlayer.Character
+    local hrp = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+    if hrp then return spawnToy(hrp.CFrame * CFrame.new(HeadOffset)) end
+    return nil
+end
+
+local function getTrainSeat()
+    local map = Workspace:FindFirstChild("Map")
+    local train = map and map:FindFirstChild("AlwaysHereTweenedObjects") and map.AlwaysHereTweenedObjects:FindFirstChild("Train")
+    local seat = train and train:FindFirstChild("Object") and train.Object:FindFirstChild("ObjectModel") and train.Object.ObjectModel:FindFirstChild("Seat")
+    if seat and (seat:IsA("Seat") or seat:IsA("VehicleSeat")) then return seat end
+    return nil
+end
+
+local function sitTrain()
+    local char = localPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local seat = getTrainSeat()
+    if hum and seat then pcall(function() seat:Sit(hum) end) end
+end
+
+local function startLoop()
+    if LoopThread then return end
+    LoopThread = task.spawn(function()
+        while Running and not (localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")) do task.wait(0.01) end
+        if not Running then LoopThread = nil return end
+        while Running do
+            local cycleStart = tick()
+            local char = localPlayer.Character
+            local hrp = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+            local egg = Workspace:FindFirstChild(EggName)
+            if hrp and egg then
+                local toy = ensureToy()
+                if toy and toy.Parent then
+                    local menu = ReplicatedStorage:FindFirstChild("MenuToys")
+                    local holdFn = (toy:FindFirstChild("HoldPart") and toy.HoldPart:FindFirstChild("HoldItemRemoteFunction")) or (menu and menu:FindFirstChild("HoldItemRemoteFunction"))
+                    if holdFn then pcall(function() holdFn:InvokeServer(toy, egg) end) end
+                    task.wait(0.03)
+                    local dropFn = (toy:FindFirstChild("HoldPart") and toy.HoldPart:FindFirstChild("DropItemRemoteFunction")) or (menu and menu:FindFirstChild("DropItemRemoteFunction"))
+                    if dropFn then pcall(function() dropFn:InvokeServer(toy, hrp.CFrame * CFrame.new(HeadOffset), Vector3.new(0, -6.55, 0)) end) end
+                end
+            end
+            local elapsed = tick() - cycleStart
+            local remain = Interval - elapsed
+            task.wait(remain > 0 and remain or 0.01)
+        end
+        LoopThread = nil
+    end)
+end
+
+local function stopLoop() Running = false end
+local function getHum() local c = localPlayer.Character return c and c:FindFirstChildOfClass("Humanoid") end
+local function isOnTrainSeat(seatPart) local trainSeat = getTrainSeat() return trainSeat and seatPart == trainSeat end
+
+-- カメラ透過
+local prevOcclusionMode = nil
+local function enableCameraNoClip()
+    if prevOcclusionMode == nil then prevOcclusionMode = localPlayer.DevCameraOcclusionMode end
+    localPlayer.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam
+end
+local function restoreCameraNoClip()
+    if prevOcclusionMode ~= nil then localPlayer.DevCameraOcclusionMode = prevOcclusionMode prevOcclusionMode = nil end
+end
+
+-- 列車飛行物理
+local function destroyVFly()
+    if BV then BV:Destroy() BV = nil end
+    if BG then BG:Destroy() BG = nil end
+    TargetPart = nil
+    VFlyEnabled = false
+end
+local function getVehicleRootFromSeat(seatPart)
+    if not seatPart then return nil end
+    local model = seatPart:FindFirstAncestorOfClass("Model")
+    if model and model.PrimaryPart then return model.PrimaryPart end
+    local ar = seatPart.AssemblyRootPart
+    if ar then return ar end
+    return seatPart
+end
+local function startVFlyForSeat(seatPart)
+    destroyVFly()
+    local part = getVehicleRootFromSeat(seatPart)
+    if not part then return end
+    BV = Instance.new("BodyVelocity")
+    BV.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    BV.P = BV_P
+    BV.Velocity = Vector3.zero
+    BV.Parent = part
+    BG = Instance.new("BodyGyro")
+    BG.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+    BG.P = BG_P
+    BG.CFrame = part.CFrame
+    BG.Parent = part
+    TargetPart = part
+    VFlyEnabled = true
+end
+local function hardStopAll()
+    TrainControl = false
+    TrainEnableAt = 0
+    LastSitAttempt = 0
+    HadSeatOnce = false
+    destroyVFly()
+    stopLoop()
+    restoreCameraNoClip()
+end
+
+----------------------------------------------------------
+-- [System] UI Construction
+----------------------------------------------------------
+local Window = OrionLib:MakeWindow({
+    Name = "LuaHub v5: Mobile (雪見だいふくSP)",
+    HidePremium = true,
+    SaveConfig = true,
+    ConfigFolder = "LuaHubMobile",
+    IntroText = "Mobile Optimized...",
+    IntroIcon = "rbxassetid://4483345998"
+})
+
+-- === Tab 1: 列車 (Train) ===
+local TrainTab = Window:MakeTab({ Name = "🚄 列車制御", Icon = "rbxassetid://4483345998" })
+local TrainToggleRef
+TrainToggleRef = TrainTab:AddToggle({
+    Name = "列車コントロール開始",
+    Default = false,
+    Callback = function(v)
+        if v then
+            TrainControl = true
+            TrainEnableAt = tick()
+            LastSitAttempt = 0
+            HadSeatOnce = false
+            Running = true
+            startLoop()
+            sitTrain()
+        else
+            hardStopAll()
+        end
+    end
+})
+TrainTab:AddSlider({ Name = "飛行速度", Min = 1, Max = 300, Default = 15, Increment = 1, Callback = function(v) FLY_SPEED = v end })
+TrainTab:AddToggle({ Name = "列車壁抜け (Noclip)", Default = false, Callback = function(v) TrainNoclipEnabled = v end })
+TrainTab:AddToggle({ Name = "列車回転 (Spin)", Default = false, Callback = function(v) TrainSpinEnabled = v end })
+TrainTab:AddSlider({ Name = "回転速度", Min = 1, Max = 50, Default = 5, Increment = 1, Callback = function(v) SPIN_SPEED = v end })
+TrainTab:AddButton({ Name = "列車へ戻る (TP)", Callback = function() local seat = getTrainSeat() if seat then localPlayer.Character.HumanoidRootPart.CFrame = seat.CFrame + Vector3.new(0,5,0) end end })
+
+-- === Tab 2: 戦闘 (Combat) ===
+local CombatTab = Window:MakeTab({ Name = "⚔️ 戦闘", Icon = "rbxassetid://18624604880" })
+local TargetName = ""
+CombatTab:AddTextbox({ Name = "ターゲット名 (一部)", Default = "", TextDisappear = false, Callback = function(v) TargetName = v end })
+
+CombatTab:AddButton({
+    Name = "Fling (突撃)",
+    Callback = function()
+        local target = nil
+        for _, v in pairs(Players:GetPlayers()) do
+            if string.match(v.Name:lower(), TargetName:lower()) then target = v break end
+        end
+        if target and target.Character then
+            local thrust = Instance.new('BodyThrust', localPlayer.Character.HumanoidRootPart)
+            thrust.Force = Vector3.new(9999,9999,9999)
+            thrust.Name = "FlingThrust"
+            local t = 0
+            local con
+            con = RunService.Stepped:Connect(function()
+                t = t + 1
+                if t > 60 or not target.Character then con:Disconnect() thrust:Destroy() return end
+                localPlayer.Character.HumanoidRootPart.CFrame = target.Character.HumanoidRootPart.CFrame
+            end)
+            OrionLib:MakeNotification({Name="Fling", Content=target.Name.." に突撃中", Time=3})
+        else
+             OrionLib:MakeNotification({Name="Error", Content="プレイヤーが見つかりません", Time=3})
+        end
+    end
+})
+
+CombatTab:AddToggle({
+    Name = "Hitbox Expander (頭部巨大化)",
+    Default = false,
+    Callback = function(v)
+        HitboxExpanded = v
+        while HitboxExpanded do
+            for _, p in pairs(Players:GetPlayers()) do
+                if p ~= localPlayer and p.Character and p.Character:FindFirstChild("Head") then
+                    p.Character.Head.Size = Vector3.new(5,5,5)
+                    p.Character.Head.Transparency = 0.5
+                    p.Character.Head.CanCollide = false
+                end
+            end
+            task.wait(1)
+        end
+    end
+})
+
+CombatTab:AddToggle({
+    Name = "Aimbot (カメラロック)",
+    Default = false,
+    Callback = function(v)
+        AimbotEnabled = v
+    end
+})
+
+-- === Tab 3: 移動 (Movement) ===
+local MoveTab = Window:MakeTab({ Name = "🏃 移動", Icon = "rbxassetid://18624601543" })
+MoveTab:AddToggle({
+    Name = "Player Fly (単体飛行)",
+    Default = false,
+    Callback = function(v)
+        PlayerFlyEnabled = v
+        if v and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            PlayerBV = Instance.new("BodyVelocity", localPlayer.Character.HumanoidRootPart)
+            PlayerBV.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+            PlayerBV.Velocity = Vector3.zero
+        elseif PlayerBV then
+            PlayerBV:Destroy() PlayerBV = nil
+        end
+    end
+})
+MoveTab:AddSlider({ Name = "歩行速度", Min = 16, Max = 500, Default = 16, Increment = 1, Callback = function(v) if localPlayer.Character then localPlayer.Character.Humanoid.WalkSpeed = v end end })
+MoveTab:AddSlider({ Name = "ジャンプ力", Min = 50, Max = 500, Default = 50, Increment = 1, Callback = function(v) if localPlayer.Character then localPlayer.Character.Humanoid.UseJumpPower = true localPlayer.Character.Humanoid.JumpPower = v end end })
+MoveTab:AddToggle({ Name = "無限ジャンプ", Default = false, Callback = function(v) InfJumpEnabled = v end })
+MoveTab:AddToggle({ Name = "壁抜け (Noclip)", Default = false, Callback = function(v) Noclip = v end })
+
+MoveTab:AddButton({
+    Name = "TP Tool入手 (タップTP)",
+    Callback = function()
+        local tool = Instance.new("Tool")
+        tool.Name = "TP Tool"
+        tool.RequiresHandle = false
+        tool.Parent = localPlayer.Backpack
+        tool.Activated:Connect(function()
+            local mouse = localPlayer:GetMouse()
+            if mouse.Target then
+                localPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(mouse.Hit.p + Vector3.new(0, 3, 0))
+            end
+        end)
+         OrionLib:MakeNotification({Name="Tool", Content="バックパックを確認してください", Time=3})
+    end
+})
+
+-- === Tab 4: 視覚 (Visuals) ===
+local VisualTab = Window:MakeTab({ Name = "👁️ 視覚", Icon = "rbxassetid://18624606749" })
+local function UpdateESP()
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= localPlayer and p.Character then
+            if ESPEnabled then
+                if not p.Character:FindFirstChild("ESPHighlight") then
+                    local hl = Instance.new("Highlight")
+                    hl.Name = "ESPHighlight"
+                    hl.Adornee = p.Character
+                    hl.FillColor = Color3.fromRGB(255, 0, 0)
+                    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                    hl.FillTransparency = 0.5
+                    hl.Parent = p.Character
+                end
+            else
+                if p.Character:FindFirstChild("ESPHighlight") then p.Character.ESPHighlight:Destroy() end
+            end
+        end
+    end
+end
+VisualTab:AddToggle({ Name = "ESP (Mobile Safe)", Default = false, Callback = function(v) ESPEnabled = v UpdateESP() end })
+VisualTab:AddToggle({
+    Name = "Fullbright (明度最大)",
+    Default = false,
+    Callback = function(v)
+        if v then
+            Lighting.Brightness = 2
+            Lighting.ClockTime = 14
+            Lighting.GlobalShadows = false
+        else
+            Lighting.Brightness = 1
+            Lighting.GlobalShadows = true
+        end
+    end
+})
+
+-- === Tab 5: ワールド (World) ===
+local WorldTab = Window:MakeTab({ Name = "🌍 ワールド", Icon = "rbxassetid://18624608005" })
+WorldTab:AddSlider({ Name = "時間操作", Min = 0, Max = 24, Default = 12, Increment = 0.5, Callback = function(v) Lighting.ClockTime = v end })
+WorldTab:AddSlider({ Name = "重力", Min = 0, Max = 200, Default = 196.2, Increment = 1, Callback = function(v) Workspace.Gravity = v end })
+WorldTab:AddButton({ Name = "Rejoin (再接続)", Callback = function() TeleportService:Teleport(game.PlaceId, localPlayer) end })
+WorldTab:AddButton({
+    Name = "Server Hop (サーバー移動)",
+    Callback = function()
+        local servers = HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"))
+        for _, server in pairs(servers.data) do
+            if server.playing < server.maxPlayers then
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, localPlayer)
+                break
+            end
+        end
+    end
+})
+
+-- === Tab 6: 外部ツール (Misc) ===
+local MiscTab = Window:MakeTab({ Name = "🔧 外部ツール", Icon = "rbxassetid://18624616682" })
+MiscTab:AddParagraph("説明", "以下のボタンで多機能ツールをロードします。")
+MiscTab:AddButton({
+    Name = "Infinite Yield (Admin Cmds)",
+    Callback = function()
+        loadstring(game:HttpGet('https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source'))()
+    end
+})
+MiscTab:AddButton({
+    Name = "Dark Dex (ファイル解析)",
+    Callback = function()
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/Babyhamsta/RBLX_Scripts/main/Universal/BypassedDarkDexV3.lua", true))()
+    end
+})
+
+----------------------------------------------------------
+-- [System] Loop & Events
+----------------------------------------------------------
+OrionLib:Init()
+
+UserInputService.JumpRequest:Connect(function()
+    if InfJumpEnabled and localPlayer.Character then localPlayer.Character:FindFirstChildOfClass('Humanoid'):ChangeState("Jumping") end
+end)
+
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function() task.wait(1) if ESPEnabled then UpdateESP() end end)
+end)
+
+RunService.RenderStepped:Connect(function()
+    -- ESP
+    if ESPEnabled then UpdateESP() end
+
+    -- Noclip
+    if Noclip and localPlayer.Character then
+        for _, part in pairs(localPlayer.Character:GetDescendants()) do
+            if part:IsA("BasePart") then part.CanCollide = false end
+        end
+    end
+
+    -- Aimbot Logic (Mobile Simple)
+    if AimbotEnabled then
+        local nearest = nil
+        local dist = math.huge
+        for _, p in pairs(Players:GetPlayers()) do
+            if p ~= localPlayer and p.Character and p.Character:FindFirstChild("Head") then
+                local d = (p.Character.Head.Position - localPlayer.Character.Head.Position).Magnitude
+                if d < dist then dist = d nearest = p end
+            end
+        end
+        if nearest then
+            Camera.CFrame = CFrame.new(Camera.CFrame.Position, nearest.Character.Head.Position)
+        end
+    end
+
+    -- Player Fly (Stick Control)
+    if PlayerFlyEnabled and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") and PlayerBV then
+        local cam = Workspace.CurrentCamera
+        local move = getMoveVector() -- スマホスティック対応
+        local dir = Vector3.zero
+        if move.Magnitude > 0 then dir = cam.CFrame.RightVector * move.X + cam.CFrame.LookVector * (-move.Z) end
+        
+        -- 上昇下降の自動化は難しいので視点方向移動を優先
+        PlayerBV.Velocity = dir * PlayerFlySpeed
+    end
+
+    -- Train Noclip
+    if TrainNoclipEnabled then
+        local trainSeat = getTrainSeat()
+        if trainSeat then
+            local model = trainSeat:FindFirstAncestor("Train")
+            if model then
+                for _, part in pairs(model:GetDescendants()) do if part:IsA("BasePart") then part.CanCollide = false end end
+            end
+        end
+    end
+
+    -- Train Core Logic
+    local hum = getHum()
+    if not hum then
+        if TrainControl or VFlyEnabled or Running then hardStopAll() if TrainToggleRef and TrainToggleRef.Set then pcall(function() TrainToggleRef:Set(false) end) end end
+        return
+    end
+    local seatPart = hum.SeatPart
+    if TrainControl then
+        if not HadSeatOnce then
+            if not seatPart then
+                if tick() - TrainEnableAt <= SeatGraceSeconds then
+                    if tick() - LastSitAttempt >= SitRetryInterval then LastSitAttempt = tick() sitTrain() end return
+                else hardStopAll() if TrainToggleRef and TrainToggleRef.Set then pcall(function() TrainToggleRef:Set(false) end) end return end
+            end
+            if not isOnTrainSeat(seatPart) then
+                if tick() - TrainEnableAt <= SeatGraceSeconds then
+                    if tick() - LastSitAttempt >= SitRetryInterval then LastSitAttempt = tick() sitTrain() end return
+                else hardStopAll() if TrainToggleRef and TrainToggleRef.Set then pcall(function() TrainToggleRef:Set(false) end) end return end
+            end
+            HadSeatOnce = true
+            enableCameraNoClip()
+            if not VFlyEnabled then startVFlyForSeat(seatPart) end
+        else
+            if not seatPart then hardStopAll() if TrainToggleRef and TrainToggleRef.Set then pcall(function() TrainToggleRef:Set(false) end) end return end
+        end
+    else
+        if VFlyEnabled or Running then hardStopAll() end
+    end
+    if not VFlyEnabled then return end
+    if not (TargetPart and TargetPart.Parent and BV and BG) then hardStopAll() if TrainToggleRef and TrainToggleRef.Set then pcall(function() TrainToggleRef:Set(false) end) end return end
+    
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local move = getMoveVector() -- スマホスティック対応
+    local dir = Vector3.zero
+    if move.Magnitude > 0 then
+        dir = cam.CFrame.RightVector * move.X + cam.CFrame.LookVector * (-move.Z)
+        if dir.Magnitude > 0 then dir = dir.Unit end
+    end
+    local speed = FLY_SPEED * SPEED_MULT
+    BV.Velocity = dir * speed
+    if TrainSpinEnabled then
+        BG.CFrame = BG.CFrame * CFrame.Angles(0, math.rad(SPIN_SPEED), 0)
+    else
+        BG.CFrame = CFrame.lookAt(TargetPart.Position, TargetPart.Position + cam.CFrame.LookVector, cam.CFrame.UpVector)
+    end
+end)
+
+localPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    hardStopAll()
+    if TrainToggleRef and TrainToggleRef.Set then pcall(function() TrainToggleRef:Set(false) end) end
+end)
